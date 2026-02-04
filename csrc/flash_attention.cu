@@ -35,67 +35,55 @@ namespace flash {
   }
 }
 
-// Apply the exp to all the elements.
-template <bool Scale_max=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
-inline __device__ void scale_apply_exp2(cute::Tensor<Engine0, Layout0> &tensor, cute::Tensor<Engine1, Layout1> const &max, const float scale) {
-    using namespace cute;
-    static_assert(Layout0::rank == 2, "Only support 2D Tensor");
-    static_assert(Layout1::rank == 1, "Only support 1D Tensor");
-    CUTE_STATIC_ASSERT_V(size<0>(max) == size<0>(tensor));
-    #pragma unroll
-    for (int mi = 0; mi < size<0>(tensor); ++mi) {
-        // If max is -inf, then all elements must have been -inf (possibly due to masking).
-        // We don't want (-inf - (-inf)) since that would give NaN.
-        // If we don't have float around M_LOG2E the multiplication is done in fp64.
-        const float max_scaled = max(mi) == -INFINITY ? 0.f : max(mi) * (Scale_max ? scale : float(M_LOG2E));
-        #pragma unroll
-        for (int ni = 0; ni < size<1>(tensor); ++ni)  {
-            // Instead of computing exp(x - max), we compute exp2(x * log_2(e) -
-            // max * log_2(e)) This allows the compiler to use the ffma
-            // instruction instead of fadd and fmul separately.
-            tensor(mi, ni) = expf(tensor(mi, ni) * scale - max_scaled);
-        }
-    }
-}
+template <typename Tensor0, typename Tensor1>
+__device__ __forceinline__ void final_softmax_rescale_o(Tensor0 &acc_o, Tensor1 &scores_sum) {
+   using namespace cute;
+#pragma unroll
+  for (int im = 0; im < size<0>(scores_sum); ++im) {
+    // reduce between quad before final rescale
+    scores_sum(im) = quad_reduce_sum_xor(scores_sum(im));
 
+    float inv_score_sum = rcpf_ftz(scores_sum(im));
+#pragma unroll
+    for (int in = 0; in < cute::size<1>(acc_o); ++in) {
+      acc_o(im, in) = acc_o(im, in) * inv_score_sum;
+    }
+  }
+}
 
 template<bool Is_first, typename Tensor0, typename Tensor1, typename Tensor2>
 inline __device__ void softmax_rescale_o(Tensor0 &scores, Tensor1 &scores_max, Tensor1 &scores_sum,
-                                         Tensor2 &acc_o, float softmax_scale) {
+                                         Tensor2 &acc_o, float softmax_scale_log2) {
     using namespace cute;
-    if (Is_first) {
-        // no need to reduce and rescale with prev result
-        reduce_max<true>(scores, scores_max);
-        scale_apply_exp2(scores, scores_max, softmax_scale);
-        reduce_sum(scores, scores_sum);
-    } else {
-        // store prev max
-        Tensor scores_max_prev = make_fragment_like(scores_max); 
-        cute::copy(scores_max, scores_max_prev);
-       
-        reduce_max<false>(scores, scores_max); 
-        
-        // traverse each row
-        #pragma unroll
-        for (int mi = 0; mi < size(scores_max); ++mi) { 
-            float scores_max_cur = scores_max(mi); 
-            // scale factor
-            float scores_scale = expf((scores_max_prev(mi) - scores_max_cur) * softmax_scale); 
-            // scale sum
-            scores_sum(mi) *= scores_scale; 
-            #pragma unroll
-            // scale output
-            for (int ni = 0; ni < size<1>(acc_o); ++ni) { acc_o(mi, ni) *= scores_scale; } 
-        }
+    // no need to reduce and rescale with prev result
+    // thread reduce -> quad reduce, to get the max value of each row of this tile
+    #pragma unroll
+    for (int mi = 0; mi < size(scores_max); ++mi) {
+      float row_sum = 0.0f;
+      float row_max = scores(mi, 0);
 
-        // softmax
-        scale_apply_exp2(scores, scores_max, softmax_scale);
+      // reduce local max before scale
+      #pragma unroll
+      for (int ni = 1; ni < size<1>(acc_o); ++ni) {
+        row_max = fmaxf(row_max, scores(mi, ni));
+      }
+      row_max = quad_reduce_max_xor(row_max) * softmax_scale_log2;
+      float prev_max = scores_max(mi);
+      scores_max(mi) = fmaxf(prev_max, row_max);
 
-        // sum scores
-        Tensor scores_sum_cur = make_fragment_like(scores_sum); 
-        reduce_sum(scores, scores_sum_cur); 
-        #pragma unroll
-        for (int mi = 0; mi < size(scores_sum); ++mi) { scores_sum(mi) += scores_sum_cur(mi); } 
+      #pragma unroll
+      for (int ni = 0; ni < size<1>(acc_o); ++ni) {
+        scores(mi, ni) = exp2f_ftz(scores(mi, ni) * softmax_scale_log2 - scores_max(mi));
+        row_sum += scores(mi, ni);
+      }
+
+      float scale = exp2f_ftz(prev_max - scores_max(mi));
+      scores_sum(mi) = scores_sum(mi) * scale + row_sum;
+
+      #pragma unroll
+      for (int ni = 0; ni < size<1>(acc_o); ++ni) {
+        acc_o(mi, ni) = acc_o(mi, ni) * scale;
+      }
     }
 };
 
@@ -118,7 +106,6 @@ __global__ void flash_attn_fp8_kernel(const Params params) {
   const int base_id = blockIdx.y;
   const int tidx = threadIdx.x;
 
-  constexpr int kNWarps = Kernel_traits::kNWarps;
   constexpr int kTileM = Kernel_traits::kTileM;
   constexpr int kTileN = Kernel_traits::kTileN;
   constexpr int kTileK = Kernel_traits::kTileK;
@@ -231,8 +218,11 @@ __global__ void flash_attn_fp8_kernel(const Params params) {
   auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
 
 
-  // load Q and first K
+  // load Q
   cute::copy(gmem_tiled_copy_QKV, tQgQ, tQsQ);
+  cute::cp_async_fence();
+
+  // load first K
   cute::copy(gmem_tiled_copy_QKV, tKgK, tKsK);
   // Q and K in one commit_group here
   cute::cp_async_fence();
@@ -258,12 +248,15 @@ __global__ void flash_attn_fp8_kernel(const Params params) {
   clear(Att_sum);
   fill(Att_max, -std::numeric_limits<ElementAccum>::infinity());
 
+  // wait for Q
+  flash::cp_async_wait<1>();
+  __syncthreads();
+  auto tSrQ_s2g = smem_thr_copy_Q.retile_D(tSrQ);
+  cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_s2g);
+
+  #pragma unroll 1
   for (int TileId = KV_Tile_Min; TileId < KV_Tile_Max; TileId++) {
     clear(tAtt);
-
-    // wait for K
-    flash::cp_async_wait<0>();
-    __syncthreads();
 
     // load V
     gV = local_tile(V, make_tile(Int<kTileK>{}, Int<kTileN>{}), make_coord(_,  TileId));
@@ -271,17 +264,19 @@ __global__ void flash_attn_fp8_kernel(const Params params) {
     cute::copy(gmem_tiled_copy_QKV, tVgV, tVsV);
     cute::cp_async_fence();
 
+    // wait for K
+    flash::cp_async_wait<1>();
+    __syncthreads();
+
     // Q*K^T gemm and s2g overlap
-    auto tSrQ_s2g = smem_thr_copy_Q.retile_D(tSrQ);
     auto tSrK_s2g = smem_thr_copy_K.retile_D(tSrK);
     // load the first batch
-    cute::copy(smem_tiled_copy_Q, tSsQ(_, _, _0{}), tSrQ_s2g(_, _, _0{}));
     cute::copy(smem_tiled_copy_K, tSsK(_, _, _0{}), tSrK_s2g(_, _, _0{}));
     
     // pipeline
+    #pragma unroll
     for (int i = 0; i < size<2>(tSrQ); i++) {
       if (i < size<2>(tSrQ) - 1) {
-        cute::copy(smem_tiled_copy_Q, tSsQ(_, _, i + 1), tSrQ_s2g(_, _, i + 1));
         cute::copy(smem_tiled_copy_K, tSsK(_, _, i + 1), tSrK_s2g(_, _, i + 1));
       }
       cute::gemm(tiled_mma, tSrQ(_, _, i), tSrK(_, _, i), tAtt);
@@ -302,8 +297,12 @@ __global__ void flash_attn_fp8_kernel(const Params params) {
         }
       }
     }
-  
-    // wait for V
+    
+    // online softmax
+    TileId == 0 ? softmax_rescale_o<true>(tAtt_mn, Att_max, Att_sum, tY_mn, params.softmax_scale) :
+      softmax_rescale_o<false>(tAtt_mn, Att_max, Att_sum, tY_mn, params.softmax_scale);
+
+      // wait for V
     flash::cp_async_wait<0>();
     __syncthreads();
     
@@ -314,14 +313,10 @@ __global__ void flash_attn_fp8_kernel(const Params params) {
       cute::copy(gmem_tiled_copy_QKV, tKgK, tKsK);
       cute::cp_async_fence();
     }
-    
-    // online softmax
-    TileId == 0 ? softmax_rescale_o<true>(tAtt_mn, Att_max, Att_sum, tY_mn, params.softmax_scale) :
-      softmax_rescale_o<false>(tAtt_mn, Att_max, Att_sum, tY_mn, params.softmax_scale);
 
     // fp32 -> fp8
     auto tAtt_float32x4 = recast<float4>(tAtt);
-    auto tAtt_fp8 = make_fragment_like<Element>(tAtt);
+    auto tAtt_fp8 = make_tensor_like<Element>(tAtt);
     auto tAtt_fp8x4 = recast<__nv_fp8x4_e4m3>(tAtt_fp8);
 
 #pragma unroll
@@ -341,6 +336,7 @@ __global__ void flash_attn_fp8_kernel(const Params params) {
     auto tOrV_s2r = smem_thr_copy_V.retile_D(tOrV);
     cute::copy(smem_tiled_copy_V, tOsV(_, _, _0{}), tOrV_s2r(_, _, _0{}));
 
+    #pragma unroll
     for (int i = 0; i < size<2>(tOrV); i++) {
       if (i < size<2>(tOrV) - 1) {
         cute::copy(smem_tiled_copy_V, tOsV(_, _, i + 1), tOrV_s2r(_, _, i + 1));
@@ -350,17 +346,7 @@ __global__ void flash_attn_fp8_kernel(const Params params) {
   } 
   
   // Epilogue
-  // rescale
-  #pragma unroll
-  for (int m = 0; m < size<0>(tY_mn); ++m) {
-    float sum = Att_sum(m);
-    float inv_sum = (sum == 0.0f || sum != sum) ? 1.0f : 1.0f / sum;
-    float scale = inv_sum;
-    #pragma unroll
-    for (int n = 0; n < size<1>(tY_mn); ++n) {
-      tY_mn(m, n) *= scale;
-    }
-  }
+  final_softmax_rescale_o(tY_mn, Att_sum);
 
   // fp32 -> fp8
   auto tY_float32x4 = recast<float4>(tYgY);
@@ -439,7 +425,7 @@ void launch_flash_attn_fp8_kernel(Flash_fwd_params &params, cudaStream_t stream)
   kernel<<<grid, block, smem_size, stream>>>(params);
 }
 
-torch::Tensor flash_attn_fp8_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, float softmax_scale) {
+torch::Tensor flash_attn_fp8_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
 
   auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
 
@@ -453,6 +439,9 @@ torch::Tensor flash_attn_fp8_forward(torch::Tensor q, torch::Tensor k, torch::Te
   int head = q.size(1);
   // seqlen
   int seqlen = q.size(2);
+  int head_dim = q.size(3);
+
+  float softmax_scale = 1.f / sqrtf(float(head_dim));
 
   auto out = torch::empty_like(q);
 

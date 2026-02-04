@@ -7,4 +7,4 @@
 #include <vector>
 
 torch::Tensor flash_attn_fp8_forward(torch::Tensor q, torch::Tensor k,
-              torch::Tensor v, float softmax_scale);
+              torch::Tensor v);

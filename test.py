@@ -52,8 +52,8 @@ def test():
     v = v.transpose(2, 3).contiguous()
 
     warmup_count = 5
-    flash2_time = warmup(warmup_count, flash_attn_fp8_forward, q, k, v, sm_scale)
-    flash2_cutlass_ref = flash_attn_fp8_forward(q, k, v, sm_scale)
+    flash2_time = warmup(warmup_count, flash_attn_fp8_forward, q, k, v)
+    flash2_cutlass_ref = flash_attn_fp8_forward(q, k, v)
 
     assert torch.allclose(baseline, flash2_cutlass_ref.to(torch.float16), rtol=0, atol=1e-2)
 
