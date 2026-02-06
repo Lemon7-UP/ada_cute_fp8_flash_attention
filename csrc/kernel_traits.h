@@ -8,7 +8,7 @@
 #include "mma_sm89.hpp"
 #include "mma_traits_sm89.hpp"
 
-template<int kTileK_, int kTileM_, int kTileN_, int kNWarps_, typename elem_type>
+template<int kTileK_, int kTileM_, int kTileN_, int kNWarps_, int kStage_, typename elem_type>
 struct Flash_fwd_kernel_traits
 {
     using Element = elem_type;
@@ -22,6 +22,7 @@ struct Flash_fwd_kernel_traits
     static constexpr int kTileM = kTileM_;
     static constexpr int kTileN = kTileN_;
     static constexpr int kTileK = kTileK_;
+    static constexpr int kStage = kStage_;
 
     //MMA atom, sm89 only fp8 mma
     using MMA_Atom_Arch = cute::MMA_Atom<cute::SM89_16x8x32_F32E4M3E4M3F32_TN>;
@@ -48,22 +49,22 @@ struct Flash_fwd_kernel_traits
 
     using SmemLayoutK = decltype(cute::tile_to_shape(
         SmemLayoutAtom{},
-        cute::Shape<cute::Int<kTileN>, cute::Int<kTileK>>{}));
+        cute::Shape<cute::Int<kTileN>, cute::Int<kTileK>, cute::Int<kStage>>{}));
     
     using SmemLayoutV = decltype(cute::tile_to_shape(
         SmemLayoutAtom{},
-        cute::Shape<cute::Int<kTileK>, cute::Int<kTileN>>{}));
+        cute::Shape<cute::Int<kTileK>, cute::Int<kTileN>, cute::Int<kStage>>{}));
 
     using SmemLayoutO = decltype(cute::tile_to_shape(
         SmemLayoutAtom{},
         cute::Shape<cute::Int<kTileM>, cute::Int<kTileK>>{}));
 
     //shared memory size
-    static constexpr int kSmemQCount = cute::size(SmemLayoutQ{});
-    static constexpr int kSmemKVCount = cute::size(SmemLayoutK{}) + cute::size(SmemLayoutV{});
+    static constexpr int kSmemQCount = cute::cosize(SmemLayoutQ{});
+    static constexpr int kSmemKVCount = cute::cosize(SmemLayoutK{}) + cute::cosize(SmemLayoutV{});
     static constexpr int kSmemQSize = kSmemQCount * sizeof(elem_type);
     static constexpr int kSmemKVSize = kSmemKVCount * sizeof(elem_type);
-    static constexpr int kSmemSize = kSmemQSize + kSmemKVSize;
+    static constexpr int kSmemSize = cute::max(kSmemQSize, kSmemKVSize);
 
     //val layout for tiled copy
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(elem_type);

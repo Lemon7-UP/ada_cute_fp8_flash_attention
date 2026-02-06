@@ -64,7 +64,7 @@ inline __device__ void softmax_rescale_o(Tensor0 &scores, Tensor1 &scores_max, T
 
       // reduce local max before scale
       #pragma unroll
-      for (int ni = 1; ni < size<1>(acc_o); ++ni) {
+      for (int ni = 1; ni < size<1>(scores); ++ni) {
         row_max = fmaxf(row_max, scores(mi, ni));
       }
       row_max = quad_reduce_max_xor(row_max) * softmax_scale_log2;
@@ -72,7 +72,7 @@ inline __device__ void softmax_rescale_o(Tensor0 &scores, Tensor1 &scores_max, T
       scores_max(mi) = fmaxf(prev_max, row_max);
 
       #pragma unroll
-      for (int ni = 0; ni < size<1>(acc_o); ++ni) {
+      for (int ni = 0; ni < size<1>(scores); ++ni) {
         scores(mi, ni) = exp2f_ftz(scores(mi, ni) * softmax_scale_log2 - scores_max(mi));
         row_sum += scores(mi, ni);
       }
@@ -87,16 +87,8 @@ inline __device__ void softmax_rescale_o(Tensor0 &scores, Tensor1 &scores_max, T
     }
 };
 
-// Shared Storage with Aligned addresses.
-template <class ElementType, class SmemLayoutQ, class SmemLayoutK, class SmemLayoutV>
-struct SharedStorage {
-  cute::array_aligned<ElementType, cute::cosize_v<SmemLayoutQ>> smem_q;
-  cute::array_aligned<ElementType, cute::cosize_v<SmemLayoutK>> smem_k;
-  cute::array_aligned<ElementType, cute::cosize_v<SmemLayoutV>> smem_v;
-};
-
 template <typename Kernel_traits, typename Params>
-__global__ void flash_attn_fp8_kernel(const Params params) {
+__global__ __launch_bounds__(Kernel_traits::kNThreads, 5) void flash_attn_fp8_kernel(const Params params) {
   using namespace cute;
 
   // because thread block will be launched in BlockIdx.x order first
@@ -109,6 +101,7 @@ __global__ void flash_attn_fp8_kernel(const Params params) {
   constexpr int kTileM = Kernel_traits::kTileM;
   constexpr int kTileN = Kernel_traits::kTileN;
   constexpr int kTileK = Kernel_traits::kTileK;
+  constexpr int kStage = Kernel_traits::kStage;
   using Element = typename Kernel_traits::Element;
   using ElementAccum = typename Kernel_traits::ElementAccum;
   using TiledMMA = typename Kernel_traits::TiledMma;
@@ -117,17 +110,22 @@ __global__ void flash_attn_fp8_kernel(const Params params) {
   using SmemLayoutV = typename Kernel_traits::SmemLayoutV;
   using SmemLayoutO = typename Kernel_traits::SmemLayoutO;
   
+  int smem_write_index = 0;
+  int smem_read_index = 0;
+
   // KV tiling range
   const int seqlen_q_start = m_block * kTileM;
   const int seqlen_q_end = (m_block + 1) * kTileM;
   const int KV_Tile_Min = 0;
-  const int KV_Tile_Max = cute::ceil_div(seqlen_q_end, kTileN); 
+  const int KV_Tile_Max = cute::ceil_div(seqlen_q_end, kTileN) - 1; 
 
-  extern __shared__ uint8_t smem_data[];
+  extern __shared__ uint8_t smem_data[] alignas(128);
   auto *smem_q = reinterpret_cast<Element *>(smem_data);
-  auto *smem_k = reinterpret_cast<Element *>(smem_q + cosize(SmemLayoutQ{}));
-  auto *smem_v = reinterpret_cast<Element *>(smem_k + cosize(SmemLayoutK{}));
-
+  // kv and q/o shared the same storage space
+  auto *smem_k = smem_q;
+  auto *smem_v = smem_k + cosize(SmemLayoutK{});
+  auto *smem_o = smem_q;
+  
   const int bs_head_offset = base_id * params.head_stride;
 
   auto *gmem_q = reinterpret_cast<Element *>(params.q_ptr) + bs_head_offset;
@@ -168,15 +166,15 @@ __global__ void flash_attn_fp8_kernel(const Params params) {
   Tensor sQ = make_tensor(make_smem_ptr(smem_q), SmemLayoutQ{});
   Tensor sK = make_tensor(make_smem_ptr(smem_k), SmemLayoutK{});
   Tensor sV = make_tensor(make_smem_ptr(smem_v), SmemLayoutV{});
-  Tensor sO = make_tensor(make_smem_ptr(smem_q), SmemLayoutO{}); 
+  Tensor sO = make_tensor(make_smem_ptr(smem_o), SmemLayoutO{}); 
 
   // gmem tiling
   // (kTileM, kTileK, num_tile_n)
   // every thread block handles one tile of Q
   Tensor gQ = local_tile(Q, make_tile(Int<kTileM>{}, Int<kTileK>{}), make_coord(m_block, _));
   // first tile of K V
-  Tensor gK = local_tile(K, make_tile(Int<kTileN>{}, Int<kTileK>{}), make_coord(0, _));
-  Tensor gV = local_tile(V, make_tile(Int<kTileK>{}, Int<kTileN>{}), make_coord(_, 0)); 
+  Tensor gK = local_tile(K, make_tile(Int<kTileN>{}, Int<kTileK>{}), make_coord(KV_Tile_Max, _));
+  Tensor gV = local_tile(V, make_tile(Int<kTileK>{}, Int<kTileN>{}), make_coord(_, KV_Tile_Max)); 
 
   // MMA
   TiledMMA tiled_mma;
@@ -189,14 +187,12 @@ __global__ void flash_attn_fp8_kernel(const Params params) {
   Tensor tQgQ = gmem_thr_copy_QKV.partition_S(gQ(_, _, 0));
   Tensor tQsQ = gmem_thr_copy_QKV.partition_D(sQ);
   Tensor tKgK = gmem_thr_copy_QKV.partition_S(gK(_, _, 0));
-  Tensor tKsK = gmem_thr_copy_QKV.partition_D(sK);
+  Tensor tKsK = gmem_thr_copy_QKV.partition_D(sK); // （CPY, CPY_N, CPY_K, kStage)
   Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV(_, _, 0));
-  Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
+  Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV); // （CPY, CPY_N, CPY_K, kStage)
 
   // S2R copy
   Tensor tSrQ  = thr_mma.partition_fragment_A(sQ);
-  Tensor tSrK  = thr_mma.partition_fragment_B(sK);
-  Tensor tOrV  = thr_mma.partition_fragment_B(sV);
 
   // S2R copy Q
   auto smem_tiled_copy_Q = make_tiled_copy_A(typename Kernel_traits::S2RCopyAtom{}, tiled_mma);
@@ -206,26 +202,37 @@ __global__ void flash_attn_fp8_kernel(const Params params) {
   // S2R copy K
   auto smem_tiled_copy_K = make_tiled_copy_B(typename Kernel_traits::S2RCopyAtom{}, tiled_mma);
   auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(tidx);
-  Tensor tSsK = smem_thr_copy_K.partition_S(sK); 
+  Tensor tSsK = smem_thr_copy_K.partition_S(sK); // (MMA, MMA_M, MMA_K, kStage)
   
   // S2R copy V
   auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::S2RCopyAtom{}, tiled_mma);
   auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
-  Tensor tOsV = smem_thr_copy_V.partition_S(sV);
+  Tensor tOsV = smem_thr_copy_V.partition_S(sV); // (MMA, MMA_N, MMA_K, kStage)
 
   // R2S copy O
   auto smem_tiled_copy_O = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomO{}, tiled_mma);
   auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
 
-
   // load Q
   cute::copy(gmem_tiled_copy_QKV, tQgQ, tQsQ);
   cute::cp_async_fence();
 
-  // load first K
-  cute::copy(gmem_tiled_copy_QKV, tKgK, tKsK);
-  // Q and K in one commit_group here
+  flash::cp_async_wait<0>();
+  __syncthreads();
+
+  // Q s2g, then Q shared memory can be used for K
+  auto tSrQ_s2g = smem_thr_copy_Q.retile_D(tSrQ);
+  cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_s2g);
+
+  __syncthreads();
+
+  // load first K and V(kStage = 2)
+  cute::copy(gmem_tiled_copy_QKV, tKgK, tKsK(_, _, _, smem_write_index));
   cute::cp_async_fence();
+
+  cute::copy(gmem_tiled_copy_QKV, tVgV, tVsV(_, _, _, smem_write_index));
+  cute::cp_async_fence();
+  smem_write_index = (smem_write_index + 1) % kStage;
 
   // allocate P and O
   auto tAtt = thr_mma.partition_fragment_C(gAtt); 
@@ -248,71 +255,144 @@ __global__ void flash_attn_fp8_kernel(const Params params) {
   clear(Att_sum);
   fill(Att_max, -std::numeric_limits<ElementAccum>::infinity());
 
-  // wait for Q
-  flash::cp_async_wait<1>();
+  // only the first tile need causal mask
+  clear(tAtt);
+
+  // load next K and V
+  gK = local_tile(K, make_tile(Int<kTileN>{}, Int<kTileK>{}), make_coord(KV_Tile_Max - 1, _));
+  tKgK = gmem_thr_copy_QKV.partition_S(gK(_, _, 0));
+  cute::copy(gmem_tiled_copy_QKV, tKgK, tKsK(_, _, _, smem_write_index));
+  cute::cp_async_fence();
+
+  gV = local_tile(V, make_tile(Int<kTileK>{}, Int<kTileN>{}), make_coord(_, KV_Tile_Max - 1));
+  tVgV = gmem_thr_copy_QKV.partition_S(gV(_, _, 0));
+  cute::copy(gmem_tiled_copy_QKV, tVgV, tVsV(_, _, _, smem_write_index));
+  cute::cp_async_fence();
+  smem_write_index = (smem_write_index + 1) % kStage;
+
+  flash::cp_async_wait<3>();
+
   __syncthreads();
-  auto tSrQ_s2g = smem_thr_copy_Q.retile_D(tSrQ);
-  cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_s2g);
+
+  // Q*K^T gemm and s2g overlap
+  Tensor tSrK  = thr_mma.partition_fragment_B(sK(_, _, _0{}));
+  auto tSrK_s2g = smem_thr_copy_K.retile_D(tSrK);
+  // load the first batch
+  cute::copy(smem_tiled_copy_K, tSsK(_, _, _0{}, smem_read_index), tSrK_s2g(_, _, _0{}));
+  
+  // pipeline
+  #pragma unroll
+  for (int i = 0; i < size<2>(tSrQ); i++) {
+    if (i < size<2>(tSrQ) - 1) {
+      cute::copy(smem_tiled_copy_K, tSsK(_, _, i + 1, smem_read_index), tSrK_s2g(_, _, i + 1));
+    }
+    cute::gemm(tiled_mma, tSrQ(_, _, i), tSrK(_, _, i), tAtt);
+  }
+
+  // causal mask
+  #pragma unroll
+  for (int im = 0; im < kM; ++im) {
+#pragma unroll
+    for (int in = 0; in < kN; ++in) {
+      int irow = m_block * kTileM + get<0>(tI_mn(im, in));
+      int icol = KV_Tile_Max * kTileN + get<1>(tI_mn(im, in));
+
+      if ((icol > irow) || (icol >= params.k_seqlen)) {
+        tAtt_mn(im, in) = -std::numeric_limits<float>::infinity();
+      }
+    }
+  }
+  
+  // online softmax
+  softmax_rescale_o<true>(tAtt_mn, Att_max, Att_sum, tY_mn, params.softmax_scale);
+
+  flash::cp_async_wait<2>();
+  __syncthreads();
+
+  // fp32 -> fp8
+  auto tAtt_float32x4 = recast<float4>(tAtt);
+  auto tAtt_fp8 = make_tensor_like<Element>(tAtt);
+  auto tAtt_fp8x4 = recast<__nv_fp8x4_e4m3>(tAtt_fp8);
+
+#pragma unroll
+  for (int i = 0; i < size(tAtt_float32x4); i++) {
+    tAtt_fp8x4(i) = __nv_fp8x4_e4m3(tAtt_float32x4(i));
+  }
+
+  // fp8 MMA C layout to A layout, need to shuffle and permute
+  auto reg2reg = ReorgCFp8toAFp8();
+  reg2reg(tAtt_fp8);
+
+  // A layout for P
+  auto tAttA_layout = thr_mma.partition_fragment_A(gAtt_fp8).layout();
+  auto tAttA_fp8 = make_tensor(tAtt_fp8.data(), tAttA_layout);
+
+  // P*V gemm and s2g overlap
+  Tensor tOrV  = thr_mma.partition_fragment_B(sV(_, _, _0{}));
+  auto tOrV_s2r = smem_thr_copy_V.retile_D(tOrV);
+  cute::copy(smem_tiled_copy_V, tOsV(_, _, _0{}, smem_read_index), tOrV_s2r(_, _, _0{}));
+
+  #pragma unroll
+  for (int i = 0; i < size<2>(tOrV); i++) {
+    if (i < size<2>(tOrV) - 1) {
+      cute::copy(smem_tiled_copy_V, tOsV(_, _, i + 1, smem_read_index), tOrV_s2r(_, _, i + 1));
+    }
+    cute::gemm(tiled_mma, tAttA_fp8(_, _, i), tOrV(_, _, i), tYgY);
+  }
+
+  smem_read_index = (smem_read_index + 1) % kStage;
 
   #pragma unroll 1
-  for (int TileId = KV_Tile_Min; TileId < KV_Tile_Max; TileId++) {
+  for (int TileId = KV_Tile_Max - 1; TileId >= KV_Tile_Min; TileId--) {
     clear(tAtt);
 
-    // load V
-    gV = local_tile(V, make_tile(Int<kTileK>{}, Int<kTileN>{}), make_coord(_,  TileId));
-    tVgV = gmem_thr_copy_QKV.partition_S(gV(_, _, 0));
-    cute::copy(gmem_tiled_copy_QKV, tVgV, tVsV);
-    cute::cp_async_fence();
+    if (TileId > 0) {
+    // load next K and V
+      gK = local_tile(K, make_tile(Int<kTileN>{}, Int<kTileK>{}), make_coord(TileId - 1, _));
+      tKgK = gmem_thr_copy_QKV.partition_S(gK(_, _, 0));
+      cute::copy(gmem_tiled_copy_QKV, tKgK, tKsK(_, _, _, smem_write_index));
+      cute::cp_async_fence();
 
-    // wait for K
-    flash::cp_async_wait<1>();
+      gV = local_tile(V, make_tile(Int<kTileK>{}, Int<kTileN>{}), make_coord(_, TileId - 1));
+      tVgV = gmem_thr_copy_QKV.partition_S(gV(_, _, 0));
+      cute::copy(gmem_tiled_copy_QKV, tVgV, tVsV(_, _, _, smem_write_index));
+      cute::cp_async_fence();
+      smem_write_index = (smem_write_index + 1) % kStage;
+
+      flash::cp_async_wait<3>();
+    }
+    else
+    {
+      flash::cp_async_wait<1>();
+    }
     __syncthreads();
 
     // Q*K^T gemm and s2g overlap
     auto tSrK_s2g = smem_thr_copy_K.retile_D(tSrK);
     // load the first batch
-    cute::copy(smem_tiled_copy_K, tSsK(_, _, _0{}), tSrK_s2g(_, _, _0{}));
+    cute::copy(smem_tiled_copy_K, tSsK(_, _, _0{}, smem_read_index), tSrK_s2g(_, _, _0{}));
     
     // pipeline
     #pragma unroll
     for (int i = 0; i < size<2>(tSrQ); i++) {
       if (i < size<2>(tSrQ) - 1) {
-        cute::copy(smem_tiled_copy_K, tSsK(_, _, i + 1), tSrK_s2g(_, _, i + 1));
+        cute::copy(smem_tiled_copy_K, tSsK(_, _, i + 1, smem_read_index), tSrK_s2g(_, _, i + 1));
       }
       cute::gemm(tiled_mma, tSrQ(_, _, i), tSrK(_, _, i), tAtt);
     }
-
-    // causal mask
-    if (TileId * kTileN >= seqlen_q_start) {
-      #pragma unroll
-      for (int im = 0; im < kM; ++im) {
-#pragma unroll
-        for (int in = 0; in < kN; ++in) {
-          int irow = m_block * kTileM + get<0>(tI_mn(im, in));
-          int icol = TileId * kTileN + get<1>(tI_mn(im, in));
-
-          if ((icol > irow) || (icol >= params.k_seqlen)) {
-            tAtt_mn(im, in) = -std::numeric_limits<float>::infinity();
-          }
-        }
-      }
-    }
     
     // online softmax
-    TileId == 0 ? softmax_rescale_o<true>(tAtt_mn, Att_max, Att_sum, tY_mn, params.softmax_scale) :
-      softmax_rescale_o<false>(tAtt_mn, Att_max, Att_sum, tY_mn, params.softmax_scale);
+    softmax_rescale_o<false>(tAtt_mn, Att_max, Att_sum, tY_mn, params.softmax_scale);
 
-      // wait for V
-    flash::cp_async_wait<0>();
-    __syncthreads();
-    
-    // load next K
-    if (TileId != KV_Tile_Max - 1) {
-      gK = local_tile(K, make_tile(Int<kTileN>{}, Int<kTileK>{}), make_coord(TileId + 1, _));
-      tKgK = gmem_thr_copy_QKV.partition_S(gK(_, _, 0));
-      cute::copy(gmem_tiled_copy_QKV, tKgK, tKsK);
-      cute::cp_async_fence();
+    if (TileId < KV_Tile_Max - 1) 
+    {
+      flash::cp_async_wait<2>();
     }
+    else
+    {
+      flash::cp_async_wait<0>();
+    }
+    __syncthreads();
 
     // fp32 -> fp8
     auto tAtt_float32x4 = recast<float4>(tAtt);
@@ -334,15 +414,17 @@ __global__ void flash_attn_fp8_kernel(const Params params) {
 
     // P*V gemm and s2g overlap
     auto tOrV_s2r = smem_thr_copy_V.retile_D(tOrV);
-    cute::copy(smem_tiled_copy_V, tOsV(_, _, _0{}), tOrV_s2r(_, _, _0{}));
+    cute::copy(smem_tiled_copy_V, tOsV(_, _, _0{}, smem_read_index), tOrV_s2r(_, _, _0{}));
 
     #pragma unroll
     for (int i = 0; i < size<2>(tOrV); i++) {
       if (i < size<2>(tOrV) - 1) {
-        cute::copy(smem_tiled_copy_V, tOsV(_, _, i + 1), tOrV_s2r(_, _, i + 1));
+        cute::copy(smem_tiled_copy_V, tOsV(_, _, i + 1, smem_read_index), tOrV_s2r(_, _, i + 1));
       }
       cute::gemm(tiled_mma, tAttA_fp8(_, _, i), tOrV(_, _, i), tYgY);
     }
+
+    smem_read_index = (smem_read_index + 1) % kStage;
   } 
   
   // Epilogue
@@ -357,7 +439,6 @@ __global__ void flash_attn_fp8_kernel(const Params params) {
   for (int i = 0; i < size(tY_float32x4); i++) {
     tY_fp8x4(i) = __nv_fp8x4_e4m3(tY_float32x4(i));
   }
-
 
   // output r2s
   Tensor tY_fp8_r2s = smem_thr_copy_O.retile_S(tY_fp8); 
@@ -416,8 +497,7 @@ void launch_flash_attn_fp8_kernel(Flash_fwd_params &params, cudaStream_t stream)
   dim3 grid(num_m_block, params.bs * params.head, 1);
   dim3 block(Kernel_traits::kNThreads);
 
-  //TODO: shared QK storage
-  int smem_size = int(sizeof(SharedStorage<Element, SmemLayoutQ, SmemLayoutK, SmemLayoutV>));
+  int smem_size = Kernel_traits::kSmemSize;
 
   auto kernel = &flash_attn_fp8_kernel<Kernel_traits, Flash_fwd_params>;
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);  
@@ -453,7 +533,7 @@ torch::Tensor flash_attn_fp8_forward(torch::Tensor q, torch::Tensor k, torch::Te
   constexpr int kTileN = 64;
   constexpr int kNWarps = 4;
   using Element = cutlass::float_e4m3_t;
-  launch_flash_attn_fp8_kernel<Flash_fwd_kernel_traits<kTileK, kTileM, kTileN, kNWarps, Element>>(params, stream);
+  launch_flash_attn_fp8_kernel<Flash_fwd_kernel_traits<kTileK, kTileM, kTileN, kNWarps, 2, Element>>(params, stream);
 
   // Wait until kernel finish.
   cudaDeviceSynchronize();
